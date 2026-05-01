@@ -1,0 +1,146 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 210 24% 94%;
+    --foreground: 206 28% 16%;
+
+    --card: 210 22% 98%;
+    --card-foreground: 206 28% 16%;
+
+    --popover: 210 22% 98%;
+    --popover-foreground: 206 28% 16%;
+
+    --primary: 197 72% 60%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 208 18% 27%;
+    --secondary-foreground: 0 0% 100%;
+
+    --muted: 207 24% 89%;
+    --muted-foreground: 206 14% 39%;
+
+    --accent: 196 64% 86%;
+    --accent-foreground: 206 28% 16%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 207 20% 82%;
+    --input: 207 20% 82%;
+    --ring: 197 72% 60%;
+
+    --radius: 0.75rem;
+
+    --sidebar-background: 208 22% 18%;
+    --sidebar-foreground: 210 20% 94%;
+    --sidebar-primary: 197 72% 60%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 208 18% 24%;
+    --sidebar-accent-foreground: 210 20% 94%;
+    --sidebar-border: 208 16% 28%;
+    --sidebar-ring: 197 72% 60%;
+
+    /* Brand tokens from Yas Marina Blue + Midnight Slate */
+    --brand-blue: 197 72% 60%;
+    --brand-blue-dark: 208 18% 27%;
+    --brand-yellow: 56 100% 50%;
+    --brand-yellow-light: 56 100% 92%;
+    --gradient-hero: linear-gradient(135deg, hsl(208 18% 24%), hsl(197 72% 60%));
+    --shadow-card: 0 14px 32px -22px hsl(208 18% 27% / 0.32);
+    --shadow-elevated: 0 22px 60px -26px hsl(197 72% 60% / 0.42);
+  }
+
+  .dark {
+    --background: 208 22% 9%;
+    --foreground: 210 20% 94%;
+
+    --card: 208 18% 13%;
+    --card-foreground: 210 20% 94%;
+
+    --popover: 208 18% 13%;
+    --popover-foreground: 210 20% 94%;
+
+    --primary: 197 72% 60%;
+    --primary-foreground: 208 22% 10%;
+
+    --secondary: 208 16% 32%;
+    --secondary-foreground: 0 0% 100%;
+
+    --muted: 208 16% 16%;
+    --muted-foreground: 210 14% 72%;
+
+    --accent: 208 16% 20%;
+    --accent-foreground: 210 20% 94%;
+
+    --destructive: 0 62% 36%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 208 15% 21%;
+    --input: 208 15% 21%;
+    --ring: 197 72% 60%;
+
+    --sidebar-background: 208 22% 9%;
+    --sidebar-foreground: 210 20% 94%;
+    --sidebar-primary: 197 72% 60%;
+    --sidebar-primary-foreground: 208 22% 10%;
+    --sidebar-accent: 208 16% 16%;
+    --sidebar-accent-foreground: 210 20% 94%;
+    --sidebar-border: 208 15% 21%;
+    --sidebar-ring: 197 72% 60%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+
+  body {
+    @apply text-foreground font-body antialiased;
+    background-color: hsl(var(--background));
+    background-image:
+      radial-gradient(circle at top left, hsl(var(--brand-blue) / 0.18), transparent 28%),
+      radial-gradient(circle at top right, hsl(var(--brand-blue-dark) / 0.16), transparent 32%),
+      linear-gradient(180deg, hsl(var(--background)), hsl(210 24% 92%));
+    background-attachment: fixed;
+  }
+
+  ::selection {
+    background: hsl(var(--primary) / 0.24);
+    color: hsl(var(--foreground));
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-display;
+  }
+}
+
+
+@layer components {
+  .surface-accent-ring {
+    box-shadow: 0 0 0 1px hsl(var(--brand-yellow) / 0.2), 0 20px 44px -28px hsl(var(--brand-yellow) / 0.55);
+  }
+
+  .cta-highlight {
+    @apply bg-brand-yellow text-secondary shadow-card hover:bg-brand-yellow/90;
+  }
+
+  .cart-progress-track {
+    background-color: hsl(var(--brand-yellow) / 0.18);
+  }
+
+  .cart-progress-indicator {
+    background-color: hsl(var(--brand-yellow));
+  }
+}

@@ -1,0 +1,426 @@
+// @ts-nocheck
+import { Router } from "express";
+import { z } from "zod";
+import { requireAuth, requireAdminPermission } from "../../middleware/auth";
+import { AppError } from "../../middleware/errorHandler";
+import { readDb, writeDb, createId, nowIso, contains, sortByDateDesc, findProductById, getProductSerialNumbers, getAvailableSerialNumbers, normalizeSerialNumber } from "../../lib/db";
+
+const router = Router();
+router.use(requireAuth);
+router.use(requireAdminPermission("orders:view"));
+
+const listQuerySchema = z.object({
+  status: z.string().optional(),
+  paymentStatus: z.string().optional(),
+  paymentMethod: z.string().optional(),
+  financeIssue: z.string().optional(),
+  start: z.string().optional(),
+  end: z.string().optional(),
+  q: z.string().optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(500).default(20),
+});
+
+const methodsRequiringTransactionReference = new Set(["mpesa", "card", "bank_transfer"]);
+
+function adminEntrant(req) {
+  const name = String(req.adminUser?.name || "").trim();
+  const email = String(req.adminUser?.email || "").trim();
+  return name && email ? `${name} <${email}>` : email || name || "admin";
+}
+
+function adminEntrantId(req, db = null) {
+  const tokenId = String(req.adminUser?.id || "").trim();
+  if (tokenId && (!db || (db.adminUsers || []).some((admin) => String(admin.id || "") === tokenId))) return tokenId;
+  const email = String(req.adminUser?.email || "").trim().toLowerCase();
+  const byEmail = (db?.adminUsers || []).find((admin) => String(admin.email || "").trim().toLowerCase() === email && String(admin.id || "").trim());
+  return byEmail?.id || tokenId || null;
+}
+
+function resolveAdminUser(db, ...refs) {
+  for (const ref of refs) {
+    const value = String(ref || "").trim();
+    if (!value) continue;
+    const lower = value.toLowerCase();
+    const admin = (db.adminUsers || []).find((item) =>
+      String(item.id || "").trim() === value ||
+      String(item.email || "").trim().toLowerCase() === lower ||
+      String(item.name || "").trim().toLowerCase() === lower
+    );
+    if (admin) return admin;
+  }
+  return null;
+}
+
+function adminDisplay(db, ...refs) {
+  const admin = resolveAdminUser(db, ...refs);
+  const fallback = refs.map((ref) => String(ref || "").trim()).find(Boolean) || null;
+  return {
+    id: admin?.id || fallback,
+    name: admin?.name || null,
+    email: admin?.email || (fallback && fallback.includes("@") ? fallback : null),
+    label: admin ? (admin.name || admin.email || admin.id) : fallback,
+  };
+}
+
+const updateOrderSchema = z.object({
+  status: z.enum(["pending", "confirmed", "processing", "completed", "delivered", "cancelled"]).optional(),
+  paymentStatus: z.enum(["pending", "partial", "paid", "failed", "refunded"]).optional(),
+  transactionReference: z.string().trim().max(120).optional().nullable(),
+  itemSerialNumbers: z.record(z.array(z.string().trim().min(1).max(191))).optional(),
+  note: z.string().max(500).optional(),
+}).refine((value) => value.status !== undefined || value.paymentStatus !== undefined || value.transactionReference !== undefined, {
+  message: "Provide at least one field to update",
+});
+
+const paymentEventSchema = z.object({
+  eventType: z.enum(["payment", "partial_payment", "refund", "payment_status_change", "adjustment"]).default("payment"),
+  amount: z.coerce.number().min(0).default(0),
+  paymentMethod: z.enum(["cash_on_delivery", "mpesa", "bank_transfer", "cash", "card", "other"]).optional().nullable(),
+  reference: z.string().trim().max(120).optional().nullable(),
+  note: z.string().trim().max(500).optional().nullable(),
+});
+
+const returnItemSchema = z.object({
+  orderItemId: z.string().trim().min(1),
+  quantity: z.coerce.number().int().min(1),
+  serialNumbers: z.array(z.string().trim().min(1).max(191)).optional(),
+});
+
+const orderReturnSchema = z.object({
+  items: z.array(returnItemSchema).min(1),
+  restoreStock: z.boolean().default(true),
+  refundAmount: z.coerce.number().min(0).default(0),
+  refundMethod: z.enum(["cash_on_delivery", "mpesa", "bank_transfer", "cash", "card", "other"]).optional().nullable(),
+  reference: z.string().trim().max(120).optional().nullable(),
+  reason: z.string().trim().max(500).optional().nullable(),
+});
+
+function shouldDeductInventory(prevStatus, nextStatus) {
+  return prevStatus === "pending" && nextStatus === "confirmed";
+}
+
+function orderAlreadyHasStockDeduction(db, orderId) {
+  return (db.inventoryMovements || []).some((movement) =>
+    String(movement.orderId || "") === String(orderId) &&
+    Number(movement.quantityChange || 0) < 0 &&
+    ["customer_checkout", "order_deducted", "pos_sale"].includes(String(movement.type || ""))
+  );
+}
+
+function shouldRestoreInventory(prevStatus, nextStatus) {
+  return ["confirmed", "processing", "completed", "delivered"].includes(prevStatus) && nextStatus === "cancelled";
+}
+
+function normalizeTransactionReference(value) {
+  const reference = String(value ?? "").trim();
+  return reference || null;
+}
+
+function paymentNeedsTransactionReference(paymentMethod, paymentStatus) {
+  return methodsRequiringTransactionReference.has(String(paymentMethod || "")) && String(paymentStatus || "") === "paid";
+}
+
+function parseDateBoundary(value, boundary) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+
+  const parsed = /^\d{4}-\d{2}-\d{2}$/.test(text)
+    ? new Date(`${text}T${boundary === "start" ? "00:00:00.000" : "23:59:59.999"}Z`)
+    : new Date(text);
+
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function isOrderInDateWindow(order, startDate, endDate) {
+  const timestamp = new Date(order.createdAt).getTime();
+  if (Number.isNaN(timestamp)) return false;
+  if (startDate && timestamp < startDate.getTime()) return false;
+  if (endDate && timestamp > endDate.getTime()) return false;
+  return true;
+}
+
+function orderMatchesFinanceIssue(db, order, issueKey) {
+  const key = String(issueKey || "").trim();
+  if (!key) return true;
+
+  if (key === "open") return buildOrderIssues(db, order).length > 0;
+  return buildOrderIssues(db, order).some((issue) => issue.key === key);
+}
+
+function activePaymentEvents(order) {
+  return (order.paymentEvents || []).filter((event) => !["payment_status_change"].includes(String(event.eventType || "")));
+}
+
+function summarizeOrderPayments(order) {
+  const totalDue = Number(order.totalAmount || 0);
+  const paidAmount = activePaymentEvents(order)
+    .filter((event) => ["payment", "partial_payment"].includes(String(event.eventType || "")))
+    .reduce((sum, event) => sum + Number(event.amount || 0), 0);
+  const refundedAmount = activePaymentEvents(order)
+    .filter((event) => String(event.eventType || "") === "refund")
+    .reduce((sum, event) => sum + Number(event.amount || 0), 0);
+  const netPaidAmount = Math.max(0, paidAmount - refundedAmount);
+  const balanceAmount = Math.max(0, totalDue - netPaidAmount);
+
+  return {
+    totalDue,
+    paidAmount,
+    refundedAmount,
+    netPaidAmount,
+    balanceAmount,
+    isFullyPaid: totalDue > 0 && netPaidAmount >= totalDue,
+    isPartiallyPaid: netPaidAmount > 0 && netPaidAmount < totalDue,
+    isFullyRefunded: totalDue > 0 && refundedAmount >= totalDue,
+  };
+}
+
+function inferPaymentStatus(order) {
+  const summary = summarizeOrderPayments(order);
+  if (summary.isFullyRefunded) return "refunded";
+  if (summary.isFullyPaid) return "paid";
+  if (summary.isPartiallyPaid) return "partial";
+  return order.paymentStatus === "failed" ? "failed" : "pending";
+}
+
+function returnedQuantityByOrderItem(order) {
+  const totals = new Map();
+  for (const entry of order.returns || []) {
+    for (const item of entry.items || []) {
+      const key = String(item.orderItemId || "");
+      if (!key) continue;
+      totals.set(key, Number(totals.get(key) || 0) + Number(item.quantity || 0));
+    }
+  }
+  return totals;
+}
+
+function buildOrderIssues(db, order) {
+  const status = normalizeOrderStatus(db, order);
+  const paymentStatus = String(order.paymentStatus || "");
+  const active = status !== "cancelled";
+  const issues = [];
+
+  if (active && paymentStatus === "pending") {
+    issues.push({
+      key: "pending_payments",
+      title: "Pending payment",
+      message: "Payment is still pending. Confirm collection before fulfilment is closed.",
+      severity: "warning",
+    });
+  }
+
+  if (active && ["pending", "confirmed", "processing"].includes(status)) {
+    issues.push({
+      key: "fulfillment_backlog",
+      title: "Fulfilment backlog",
+      message: "Order still needs confirmation, processing, completion, or delivery follow-up.",
+      severity: "warning",
+    });
+  }
+
+  if (paymentStatus === "partial") {
+    const summary = summarizeOrderPayments(order);
+    issues.push({
+      key: "partial_payments",
+      title: "Partially paid",
+      message: `Customer has paid ${summary.netPaidAmount} of ${summary.totalDue}. Balance collection is still pending.`,
+      severity: "warning",
+    });
+  }
+
+  if ((order.returns || []).length > 0) {
+    issues.push({
+      key: "returned_items",
+      title: "Returned item history",
+      message: "This order has return/refund records. Review stock restoration and customer refund notes.",
+      severity: "warning",
+    });
+  }
+
+  if (paymentStatus === "failed") {
+    issues.push({
+      key: "failed_payments",
+      title: "Failed payment",
+      message: "Payment failed. Follow up with the customer before processing this order.",
+      severity: "destructive",
+    });
+  }
+
+  if (
+    active &&
+    paymentStatus === "paid" &&
+    paymentNeedsTransactionReference(order.paymentMethod, paymentStatus) &&
+    !String(order.transactionReference || "").trim()
+  ) {
+    issues.push({
+      key: "missing_references",
+      title: "Missing transaction reference",
+      message: "This paid digital-payment order has no M-Pesa, card, or bank transfer reference recorded.",
+      severity: "destructive",
+    });
+  }
+
+  if (active && paymentStatus === "paid" && !["completed", "delivered"].includes(status)) {
+    issues.push({
+      key: "paid_not_completed",
+      title: "Paid but not completed",
+      message: "Payment is complete, but fulfilment is still not completed or delivered.",
+      severity: "warning",
+    });
+  }
+
+  if (paymentStatus === "refunded") {
+    issues.push({
+      key: "refunded_orders",
+      title: "Refunded order",
+      message: "This order is marked as refunded. Confirm stock and customer follow-up are complete.",
+      severity: "warning",
+    });
+  }
+
+  return issues;
+}
+
+function normalizeSerialList(values) {
+  const seen = new Set();
+  return (Array.isArray(values) ? values : [])
+    .map((value) => normalizeSerialNumber(value))
+    .filter(Boolean)
+    .filter((value) => {
+      const key = value.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function assignOrderItemSerials(db, product, order, item, requestedSerialNumbers, soldAt, reservedSerialKeys = new Set()) {
+  const trackedSerials = getProductSerialNumbers(db, product.id);
+  if (!trackedSerials.length) {
+    item.serialNumbers = [];
+    return;
+  }
+
+  const selectedSerials = normalizeSerialList(requestedSerialNumbers);
+  if (selectedSerials.length !== Number(item.quantity || 0)) {
+    throw new AppError(400, `${product.name} requires ${item.quantity} serial number(s) before confirmation`);
+  }
+
+  const trackedByKey = new Map(
+    trackedSerials.map((serial) => [normalizeSerialNumber(serial.serialNumber).toLowerCase(), serial])
+  );
+
+  const availableByKey = new Map(
+    getAvailableSerialNumbers(db, product.id)
+      .filter((serial) => !reservedSerialKeys.has(normalizeSerialNumber(serial.serialNumber).toLowerCase()))
+      .map((serial) => [normalizeSerialNumber(serial.serialNumber).toLowerCase(), serial])
+  );
+
+  const assigned = [];
+  for (const serialNumber of selectedSerials) {
+    const serialKey = serialNumber.toLowerCase();
+
+    if (reservedSerialKeys.has(serialKey)) {
+      throw new AppError(400, `Serial number ${serialNumber} is already used in this order`);
+    }
+
+    const serial = availableByKey.get(serialKey);
+    if (!serial) {
+      if (trackedByKey.has(serialKey)) {
+        throw new AppError(400, `Serial number ${serialNumber} has already been sold for ${product.name}`);
+      }
+
+      throw new AppError(400, `Serial number ${serialNumber} is not available for ${product.name}`);
+    }
+
+    serial.status = "sold";
+    serial.orderId = order.id;
+    serial.orderItemId = item.id;
+    serial.soldAt = soldAt;
+    reservedSerialKeys.add(serialKey);
+    assigned.push(serial.serialNumber);
+  }
+  item.serialNumbers = assigned;
+}
+
+function releaseOrderSerials(db, order) {
+  for (const item of order.items || []) {
+    item.serialNumbers = [];
+  }
+}
+
+function findCustomerByOrder(db, order) {
+  return db.customerUsers.find((item) => item.id === order.customerId);
+}
+
+function isWalkInOrder(db, order) {
+  return !findCustomerByOrder(db, order) && String(order.deliveryAddress || "").trim() === "In-store POS sale";
+}
+
+function normalizeOrderStatus(db, order) {
+  return isWalkInOrder(db, order) && order.status === "delivered" ? "completed" : order.status;
+}
+
+function formatOrder(db, order) {
+  const customer = findCustomerByOrder(db, order);
+  const isWalkInCustomer = isWalkInOrder(db, order);
+  const entrant = adminDisplay(db, order.createdByAdminUserId, order.dataEntrant, order.createdBy);
+  const items = (order.items || []).map((item) => {
+    const product = findProductById(db, item.productId);
+    const sourceId = item.sourceId || product?.sourceId || null;
+    const source = sourceId ? (db.productSources || []).find((row) => row.id === sourceId) : null;
+    const quantity = Number(item.quantity || 0);
+    const unitSellingPrice = Number(item.unitSellingPrice ?? item.unitPrice ?? product?.price ?? 0);
+    const totalSellingPrice = Number(item.totalSellingPrice ?? unitSellingPrice * quantity);
+    const unitSourcePrice = Number(item.unitSourcePrice ?? product?.sourcePrice ?? 0);
+    const totalSourcePrice = Number(item.totalSourcePrice ?? unitSourcePrice * quantity);
+    const vatAmount = Number(item.vatAmount || 0);
+    const grossProfit = totalSellingPrice - totalSourcePrice;
+
+    return {
+      id: item.id,
+      productId: item.productId,
+      productName: item.productName || product?.name || "Unknown product",
+      productBrand: item.productBrand || product?.brand || null,
+      productBarcode: item.productBarcode || product?.barcode || null,
+      brand: item.productBrand || product?.brand || null,
+      barcode: item.productBarcode || product?.barcode || null,
+      quantity,
+      unitPrice: Number(item.unitPrice ?? unitSellingPrice),
+      totalPrice: Number(item.totalPrice ?? totalSellingPrice + vatAmount),
+      unitSellingPrice,
+      totalSellingPrice,
+      unitSourcePrice,
+      totalSourcePrice,
+      sourcePrice: unitSourcePrice,
+      sourceCost: totalSourcePrice,
+      sourceId,
+      sourceName: item.sourceName || source?.name || null,
+      sourcePaymentStatus: item.sourcePaymentStatus || product?.sourcePaymentStatus || null,
+      vatRate: Number(item.vatRate || order.vatRate || 0),
+      vatAmount,
+      grossProfit,
+      returnedQuantity: Number(returnedQuantities.get(String(item.id)) || 0),
+      returnableQuantity: Math.max(0, quantity - Number(returnedQuantities.get(String(item.id)) || 0)),
+      serialNumbers: item.serialNumbers || [],
+      product: product ? {
+        id: product.id,
+        name: product.name,
+        slug: product.slug,
+        image: product.images?.[0] || null,
+        stockQuantity: product.stockQuantity,
+        barcode: product.barcode || null,
+        salesChannel: product.salesChannel || "catalog",
+        isCatalogVisible: product.isCatalogVisible !== false,
+        availableSerialNumbers: getAvailableSerialNumbers(db, product.id).map((serial) => serial.serialNumber),
+      } : undefined,
+    };
+  });
+
+  const totalSourcePrice = items.reduce((sum, item) => sum + Number(item.totalSourcePrice || 0), 0);
+  const totalSellingPrice = items.reduce((sum, item) => sum + Number(item.totalSellingPrice || 0), 0);
+  const totalVatAmount = Number(order.vatAmount ?? items.reduce((sum, item) => sum + Number(item.vatAmount || 0), 0));
+  const paymentSummary = summarizeOrderPayments(order);
+  const returnedQuantities = returnedQuantityByOrderItem(order);
+  const paymentEvents = (orde
