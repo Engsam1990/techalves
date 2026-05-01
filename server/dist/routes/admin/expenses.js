@@ -1,0 +1,244 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+// @ts-nocheck
+const express_1 = require("express");
+const zod_1 = require("zod");
+const auth_1 = require("../../middleware/auth");
+const db_1 = require("../../lib/db");
+const errorHandler_1 = require("../../middleware/errorHandler");
+const router = (0, express_1.Router)();
+router.use(auth_1.requireAuth);
+const expenseSchema = zod_1.z.object({
+    categoryId: zod_1.z.string().min(1),
+    productId: zod_1.z.string().optional().nullable(),
+    sourceId: zod_1.z.string().optional().nullable(),
+    orderId: zod_1.z.string().optional().nullable(),
+    orderItemId: zod_1.z.string().optional().nullable(),
+    amount: zod_1.z.coerce.number().min(0),
+    expenseDate: zod_1.z.string().trim().optional().nullable(),
+    date: zod_1.z.string().trim().optional().nullable(),
+    paymentMethod: zod_1.z.enum(["cash", "mpesa", "card", "bank_transfer", "other"]).optional().nullable(),
+    reference: zod_1.z.string().trim().max(120).optional().nullable(),
+    description: zod_1.z.string().trim().min(1, "Description is required").max(2000),
+    details: zod_1.z.string().trim().max(2000).optional().nullable(),
+});
+function adminEntrant(db, req) {
+    const tokenId = String(req.adminUser?.id || "").trim();
+    if (tokenId && (db.adminUsers || []).some((admin) => String(admin.id || "") === tokenId))
+        return tokenId;
+    const email = String(req.adminUser?.email || "").trim().toLowerCase();
+    const byEmail = (db.adminUsers || []).find((admin) => String(admin.email || "").trim().toLowerCase() === email && String(admin.id || "").trim());
+    return byEmail?.id || tokenId || null;
+}
+function resolveAdminUser(db, ...refs) {
+    for (const ref of refs) {
+        const value = String(ref || "").trim();
+        if (!value)
+            continue;
+        const lower = value.toLowerCase();
+        const admin = (db.adminUsers || []).find((item) => String(item.id || "").trim() === value ||
+            String(item.email || "").trim().toLowerCase() === lower ||
+            String(item.name || "").trim().toLowerCase() === lower);
+        if (admin)
+            return admin;
+    }
+    return null;
+}
+function adminDisplay(db, ...refs) {
+    const admin = resolveAdminUser(db, ...refs);
+    const fallback = refs.map((ref) => String(ref || "").trim()).find(Boolean) || null;
+    return {
+        id: admin?.id || fallback,
+        name: admin?.name || null,
+        email: admin?.email || (fallback && fallback.includes("@") ? fallback : null),
+        label: admin ? (admin.name || admin.email || admin.id) : fallback,
+    };
+}
+function adminScopeValues(req) {
+    return [req.adminUser?.id, req.adminUser?.email, req.adminUser?.name]
+        .map((value) => String(value || "").trim().toLowerCase())
+        .filter(Boolean);
+}
+function isOwnAdminRecord(req, record, ...extraRefs) {
+    const scopeValues = adminScopeValues(req);
+    const refs = [
+        record?.createdByAdminUserId,
+        record?.dataEntrant,
+        record?.createdBy,
+        ...extraRefs,
+    ].map((value) => String(value || "").trim().toLowerCase());
+    return refs.some((ref) => ref && scopeValues.includes(ref));
+}
+function categoryById(db, id) { return (db.expenseCategories || []).find((item) => item.id === id); }
+function isSupplierCategory(category) { return String(category?.slug || "").toLowerCase() === "supplier"; }
+function isSaleCategory(category) { return String(category?.slug || "").toLowerCase() === "sale"; }
+function supplierExpenseExistsForProduct(db, productId, excludeExpenseId = null) {
+    const id = String(productId || "").trim();
+    if (!id)
+        return false;
+    return (db.expenses || []).some((expense) => {
+        if (excludeExpenseId && String(expense.id) === String(excludeExpenseId))
+            return false;
+        const category = String(expense.category || "").toLowerCase();
+        const categoryId = String(expense.categoryId || "");
+        return String(expense.productId || "") === id && (category === "supplier" || categoryId === "expense-cat-supplier");
+    });
+}
+function saleExpenseExistsForOrderProduct(db, orderId, productId, orderItemId = null, excludeExpenseId = null) {
+    const oid = String(orderId || "").trim();
+    const pid = String(productId || "").trim();
+    const itemId = String(orderItemId || "").trim();
+    if (!oid || !pid)
+        return false;
+    return (db.expenses || []).some((expense) => {
+        if (excludeExpenseId && String(expense.id) === String(excludeExpenseId))
+            return false;
+        const category = String(expense.category || "").toLowerCase();
+        const categoryId = String(expense.categoryId || "");
+        if (!(category === "sale" || categoryId === "expense-cat-sale"))
+            return false;
+        if (String(expense.orderId || "") !== oid)
+            return false;
+        if (itemId) {
+            if (String(expense.orderItemId || "") === itemId)
+                return true;
+            return !String(expense.orderItemId || "").trim() && String(expense.productId || "") === pid;
+        }
+        return String(expense.productId || "") === pid;
+    });
+}
+function findOrderItemForExpense(order, productId, orderItemId = null) {
+    const itemId = String(orderItemId || "").trim();
+    const pid = String(productId || "").trim();
+    const items = Array.isArray(order?.items) ? order.items : [];
+    if (itemId)
+        return items.find((item) => String(item.id || "") === itemId) || null;
+    if (pid)
+        return items.find((item) => String(item.productId || "") === pid) || null;
+    return null;
+}
+function formatExpense(db, expense) {
+    const category = categoryById(db, expense.categoryId);
+    const source = (db.productSources || []).find((item) => item.id === expense.sourceId);
+    const product = expense.productId ? (0, db_1.findProductById)(db, expense.productId) : null;
+    const entrant = adminDisplay(db, expense.createdByAdminUserId, expense.dataEntrant, expense.createdBy);
+    return {
+        ...expense,
+        categoryName: category?.name || expense.categoryName || expense.category,
+        categorySlug: category?.slug || expense.category,
+        sourceName: source?.name || expense.sourceName || null,
+        productName: product?.name || null,
+        dataEntrantId: entrant.id || null,
+        dataEntrantName: entrant.name || null,
+        dataEntrantEmail: entrant.email || null,
+        dataEntrantLabel: entrant.label || null,
+    };
+}
+router.get("/categories", async (_req, res, next) => {
+    try {
+        const db = await (0, db_1.readDb)();
+        res.json((db.expenseCategories || []).filter((item) => item.isActive !== false && !["order", "supplier"].includes(String(item.slug || item.name || "").toLowerCase())));
+    }
+    catch (e) {
+        next(e);
+    }
+});
+router.get("/", (0, auth_1.requireAdminPermission)("expenses:view"), async (req, res, next) => {
+    try {
+        const q = String(req.query.q || "").trim();
+        const db = await (0, db_1.readDb)();
+        const items = (db.expenses || [])
+            .filter((expense) => String(expense.category || "").toLowerCase() !== "supplier" && String(expense.categoryId || "") !== "expense-cat-supplier")
+            .filter((expense) => (0, auth_1.hasAdminPermission)(req.adminUser, "expenses:view_all") || isOwnAdminRecord(req, expense))
+            .filter((expense) => !q || [expense.details, expense.description, expense.reference, expense.category, expense.sourceName].some((value) => (0, db_1.contains)(value, q)))
+            .sort((a, b) => new Date(b.expenseDate || b.date || b.createdAt).getTime() - new Date(a.expenseDate || a.date || a.createdAt).getTime())
+            .map((expense) => formatExpense(db, expense));
+        res.json(items);
+    }
+    catch (e) {
+        next(e);
+    }
+});
+router.post("/", (0, auth_1.requireAdminPermission)("expenses:create"), async (req, res, next) => {
+    try {
+        const data = expenseSchema.parse(req.body);
+        const db = await (0, db_1.readDb)();
+        const category = categoryById(db, data.categoryId);
+        if (!category)
+            throw new errorHandler_1.AppError(400, "Expense category not found");
+        if (isSupplierCategory(category)) {
+            throw new errorHandler_1.AppError(400, "Supplier/product acquisition cost must be recorded through product sourcing, not Expenses");
+        }
+        const product = data.productId ? (0, db_1.findProductById)(db, data.productId) : null;
+        if (data.productId && !product)
+            throw new errorHandler_1.AppError(400, "Product not found");
+        let sourceId = data.sourceId || null;
+        if (isSupplierCategory(category)) {
+            if (!product)
+                throw new errorHandler_1.AppError(400, "Supplier expenses require a product");
+            if (!product.sourceId)
+                throw new errorHandler_1.AppError(400, "Selected product has no supplier/source assigned");
+            if (sourceId && sourceId !== product.sourceId)
+                throw new errorHandler_1.AppError(400, "Supplier/source must match the selected product source");
+            if (supplierExpenseExistsForProduct(db, product.id))
+                throw new errorHandler_1.AppError(400, "This product already has a supplier/product acquisition expense recorded");
+            sourceId = product.sourceId;
+        }
+        let orderItemId = data.orderItemId || null;
+        if (isSaleCategory(category)) {
+            if (!data.orderId)
+                throw new errorHandler_1.AppError(400, "Sale expenses require an order");
+            if (!product)
+                throw new errorHandler_1.AppError(400, "Sale expenses require the product/accessory given to the customer");
+            const order = (db.orders || []).find((item) => String(item.id) === String(data.orderId));
+            if (!order)
+                throw new errorHandler_1.AppError(400, "Order not found");
+            const orderItem = findOrderItemForExpense(order, product.id, orderItemId);
+            if (!orderItem) {
+                throw new errorHandler_1.AppError(400, "Selected product/accessory does not belong to the selected sale/order");
+            }
+            if (String(orderItem.productId || "") !== String(product.id)) {
+                throw new errorHandler_1.AppError(400, "Selected product/accessory does not match the selected sale/order item");
+            }
+            orderItemId = orderItem.id || orderItemId || null;
+            if (!sourceId && orderItem.sourceId)
+                sourceId = orderItem.sourceId;
+            if (saleExpenseExistsForOrderProduct(db, data.orderId, product.id, orderItemId)) {
+                throw new errorHandler_1.AppError(400, "This sale/order already has an expense for the selected product/accessory");
+            }
+        }
+        if (sourceId && !(db.productSources || []).some((item) => item.id === sourceId))
+            throw new errorHandler_1.AppError(400, "Supplier/source not found");
+        const now = (0, db_1.nowIso)();
+        const expense = {
+            id: (0, db_1.createId)(),
+            categoryId: category.id,
+            category: category.slug,
+            productId: data.productId || null,
+            sourceId,
+            orderId: data.orderId || null,
+            orderItemId,
+            amount: Number(data.amount || 0),
+            expenseDate: data.expenseDate || data.date || now.slice(0, 10),
+            date: data.expenseDate || data.date || now.slice(0, 10),
+            paymentStatus: "paid",
+            paymentMethod: data.paymentMethod || null,
+            reference: data.reference || null,
+            description: data.description,
+            details: data.details || data.description || category.name,
+            createdByAdminUserId: adminEntrant(db, req),
+            dataEntrant: adminEntrant(db, req),
+            entryDate: now,
+            createdAt: now,
+            updatedAt: now,
+        };
+        db.expenses = [expense, ...(db.expenses || [])];
+        await (0, db_1.writeDb)(db);
+        res.status(201).json(formatExpense(db, expense));
+    }
+    catch (e) {
+        next(e);
+    }
+});
+exports.default = router;
+//# sourceMappingURL=expenses.js.map
